@@ -1063,10 +1063,6 @@ def make_unmatched_location_chart():
 def question1_layout():
     return html.Div([
         html.H2("Question 1 — Credit and Loyalty Card Analysis"),
-        html.P(
-            "Goal: identify popular locations, when they are popular, "
-            "and anomalies in credit/loyalty card data."
-        ),
 
         dcc.Graph(figure=make_cc_vs_loyalty_locations()),
         dcc.Graph(figure=make_anomaly_chart()),
@@ -1096,10 +1092,6 @@ def question1_layout():
 def question2_layout():
     return html.Div([
         html.H2("Question 2 — Vehicle, Credit, and Loyalty Analysis"),
-        html.P(
-            "Goal: compare vehicle GPS traces with credit and loyalty transactions "
-            "to find missing, conflicting, or suspicious evidence."
-        ),
 
         dcc.Graph(figure=make_match_status_chart()),
         dcc.Graph(figure=make_unmatched_location_chart()),
