@@ -59,6 +59,34 @@ gps = gps.sort_values(["id", "timestamp"])
 
 vehicles = sorted(gps["id"].unique())
 locations = sorted(cc["location"].unique())
+car_assignments = pd.read_csv("data/car-assignments.csv")
+
+car_assignments.columns = car_assignments.columns.str.strip().str.lower()
+car_assignments["name"] = (
+    car_assignments["firstname"].astype(str) + " " +
+    car_assignments["lastname"].astype(str)
+)
+car_assignments = car_assignments.rename(columns={"carid": "id"})
+car_assignments["id"] = car_assignments["id"].astype("Int64")
+
+gps = gps.merge(
+    car_assignments[["id", "name", "currentemploymenttype", "currentemploymenttitle"]],
+    on="id",
+    how="left"
+)
+
+gps["display_name"] = gps.apply(
+    lambda row: f"{int(row['id'])} — {row['name']}"
+    if pd.notna(row["name"])
+    else f"{int(row['id'])} — Unknown driver",
+    axis=1
+)
+
+vehicle_options = (
+    gps[["id", "display_name"]]
+    .drop_duplicates()
+    .sort_values("id")
+)
 
 # -------------------------
 # Helper functions
@@ -247,6 +275,313 @@ def match_transactions_to_vehicles():
 
     return pd.DataFrame(results)
 
+def get_driver_name(vehicle_id):
+    match = car_assignments[car_assignments["id"] == vehicle_id]
+
+    if match.empty:
+        return "Unknown driver"
+
+    return match.iloc[0]["name"]
+
+
+def get_vehicle_card_matches():
+    transactions = get_transactions()
+    valid_locations = get_valid_location_coords()
+
+    results = []
+
+    for _, tx in transactions.iterrows():
+        tx_time = tx["timestamp"]
+        tx_location = tx["location"]
+
+        business = valid_locations[valid_locations["location"] == tx_location]
+
+        if business.empty:
+            continue
+
+        business_x = business.iloc[0]["x_pix"]
+        business_y = business.iloc[0]["y_pix"]
+
+        time_min = tx_time - pd.Timedelta(minutes=TIME_WINDOW_MINUTES)
+        time_max = tx_time + pd.Timedelta(minutes=TIME_WINDOW_MINUTES)
+
+        nearby_gps = gps[
+            (gps["timestamp"] >= time_min) &
+            (gps["timestamp"] <= time_max)
+        ].copy()
+
+        if nearby_gps.empty:
+            continue
+
+        nearby_gps["distance"] = (
+            (nearby_gps["x_pix"] - business_x) ** 2 +
+            (nearby_gps["y_pix"] - business_y) ** 2
+        ) ** 0.5
+
+        nearby_gps = nearby_gps[
+            nearby_gps["distance"] <= DISTANCE_THRESHOLD_PIXELS
+        ]
+
+        if nearby_gps.empty:
+            continue
+
+        best_per_vehicle = (
+            nearby_gps
+            .sort_values("distance")
+            .groupby("id")
+            .first()
+            .reset_index()
+        )
+
+        for _, vehicle in best_per_vehicle.iterrows():
+            results.append({
+                "timestamp": tx_time,
+                "day": tx_time.date(),
+                "location": tx_location,
+                "source": tx["source"],
+                "card_id": tx["card_id"],
+                "vehicle_id": vehicle["id"],
+                "driver_name": vehicle["name"],
+                "distance": vehicle["distance"]
+            })
+
+    return pd.DataFrame(results)
+
+
+vehicle_card_matches = get_vehicle_card_matches()
+
+
+def infer_card_owners():
+    if vehicle_card_matches.empty:
+        return pd.DataFrame()
+
+    grouped = (
+        vehicle_card_matches
+        .groupby(["source", "card_id", "vehicle_id", "driver_name"])
+        .agg(
+            match_count=("timestamp", "count"),
+            unique_days=("day", "nunique"),
+            unique_locations=("location", "nunique"),
+            avg_distance=("distance", "mean"),
+            min_distance=("distance", "min")
+        )
+        .reset_index()
+    )
+
+    grouped["confidence_score"] = (
+        grouped["match_count"] * 2
+        + grouped["unique_days"] * 3
+        + grouped["unique_locations"] * 2
+        - grouped["avg_distance"] / 20
+    )
+
+    grouped["confidence_score"] = grouped["confidence_score"].round(2)
+    grouped["avg_distance"] = grouped["avg_distance"].round(2)
+    grouped["min_distance"] = grouped["min_distance"].round(2)
+
+    grouped = grouped.sort_values(
+        ["source", "card_id", "confidence_score"],
+        ascending=[True, True, False]
+    )
+
+    grouped["rank_for_card"] = (
+        grouped
+        .groupby(["source", "card_id"])
+        .cumcount() + 1
+    )
+
+    return grouped
+
+
+card_owner_scores = infer_card_owners()
+
+
+def get_best_card_owner_table():
+    best = card_owner_scores[card_owner_scores["rank_for_card"] == 1].copy()
+
+    best = best.sort_values("confidence_score", ascending=False)
+
+    return best[[
+        "source",
+        "card_id",
+        "vehicle_id",
+        "driver_name",
+        "match_count",
+        "unique_days",
+        "unique_locations",
+        "avg_distance",
+        "confidence_score"
+    ]]
+
+def get_overnight_locations():
+    night_gps = gps[
+        (gps["timestamp"].dt.hour >= 22) |
+        (gps["timestamp"].dt.hour <= 5)
+    ].copy()
+
+    overnight = (
+        night_gps
+        .groupby(["id", "name", night_gps["timestamp"].dt.date])
+        .agg(
+            x_pix=("x_pix", "mean"),
+            y_pix=("y_pix", "mean"),
+            point_count=("timestamp", "count")
+        )
+        .reset_index()
+        .rename(columns={"timestamp": "date"})
+    )
+
+    return overnight
+
+
+overnight_locations = get_overnight_locations()
+
+
+def get_home_locations():
+    home = (
+        overnight_locations
+        .groupby(["id", "name"])
+        .agg(
+            home_x=("x_pix", "median"),
+            home_y=("y_pix", "median"),
+            nights_observed=("date", "nunique")
+        )
+        .reset_index()
+    )
+
+    return home
+
+
+home_locations = get_home_locations()
+
+
+def get_sleepover_anomalies():
+    overnight = overnight_locations.merge(
+        home_locations[["id", "home_x", "home_y"]],
+        on="id",
+        how="left"
+    )
+
+    overnight["distance_from_home"] = (
+        (overnight["x_pix"] - overnight["home_x"]) ** 2 +
+        (overnight["y_pix"] - overnight["home_y"]) ** 2
+    ) ** 0.5
+
+    anomalies = overnight[overnight["distance_from_home"] > 250].copy()
+    anomalies["distance_from_home"] = anomalies["distance_from_home"].round(1)
+
+    return anomalies.sort_values("distance_from_home", ascending=False)
+
+
+sleepover_anomalies = get_sleepover_anomalies()
+
+def make_home_location_map():
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(
+        x=home_locations["home_x"],
+        y=home_locations["home_y"],
+        mode="markers+text",
+        text=home_locations["name"],
+        textposition="top center",
+        marker=dict(
+            size=12,
+            symbol="circle",
+            line=dict(width=2)
+        ),
+        name="Estimated home locations",
+        customdata=home_locations[["id", "nights_observed"]],
+        hovertemplate=(
+            "Driver: %{text}<br>"
+            "Vehicle: %{customdata[0]}<br>"
+            "Nights observed: %{customdata[1]}"
+            "<extra></extra>"
+        )
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=sleepover_anomalies["x_pix"],
+        y=sleepover_anomalies["y_pix"],
+        mode="markers",
+        marker=dict(
+            size=14,
+            symbol="x",
+            line=dict(width=3)
+        ),
+        name="Possible sleepover / away overnight",
+        customdata=sleepover_anomalies[[
+            "name",
+            "id",
+            "date",
+            "distance_from_home"
+        ]],
+        hovertemplate=(
+            "Driver: %{customdata[0]}<br>"
+            "Vehicle: %{customdata[1]}<br>"
+            "Date: %{customdata[2]}<br>"
+            "Distance from usual overnight location: %{customdata[3]} px"
+            "<extra></extra>"
+        )
+    ))
+
+    fig.update_layout(
+        title="Estimated Home Locations and Overnight Anomalies",
+        images=[dict(
+            source="data:image/jpeg;base64," + encoded_map,
+            xref="x",
+            yref="y",
+            x=0,
+            y=IMAGE_HEIGHT,
+            sizex=IMAGE_WIDTH,
+            sizey=IMAGE_HEIGHT,
+            sizing="stretch",
+            opacity=1,
+            layer="below"
+        )],
+        xaxis=dict(
+            range=[0, IMAGE_WIDTH],
+            visible=False,
+            showgrid=False,
+            zeroline=False
+        ),
+        yaxis=dict(
+            range=[0, IMAGE_HEIGHT],
+            visible=False,
+            showgrid=False,
+            zeroline=False,
+            scaleanchor="x"
+        ),
+        height=850,
+        margin=dict(l=0, r=0, t=40, b=0)
+    )
+
+    return fig
+
+
+def make_sleepover_table():
+    table = sleepover_anomalies.copy()
+    table["date"] = table["date"].astype(str)
+
+    return dash_table.DataTable(
+        columns=[
+            {"name": "Vehicle", "id": "id"},
+            {"name": "Driver", "id": "name"},
+            {"name": "Date", "id": "date"},
+            {"name": "Distance from Home", "id": "distance_from_home"},
+            {"name": "GPS Points", "id": "point_count"}
+        ],
+        data=table[[
+            "id",
+            "name",
+            "date",
+            "distance_from_home",
+            "point_count"
+        ]].to_dict("records"),
+        page_size=15,
+        sort_action="native",
+        filter_action="native",
+        style_table={"overflowX": "auto"}
+    )
 
 # -------------------------
 # Figures
@@ -343,7 +678,7 @@ def make_vehicle_map(df, layers):
         ))
 
     fig.update_layout(
-        title="Vehicle Movement Map",
+        #title="Vehicle Movement Map",
         images=[dict(
             source="data:image/jpeg;base64," + encoded_map,
             xref="x",
@@ -617,6 +952,58 @@ def make_location_timeline(location):
 
     return fig
 
+def make_card_owner_heatmap(source_type="credit"):
+    df = card_owner_scores[card_owner_scores["source"] == source_type].copy()
+
+    if df.empty:
+        return go.Figure()
+
+    pivot = df.pivot_table(
+        index="driver_name",
+        columns="card_id",
+        values="confidence_score",
+        aggfunc="max",
+        fill_value=0
+    )
+
+    fig = go.Figure(data=go.Heatmap(
+        z=pivot.values,
+        x=pivot.columns,
+        y=pivot.index,
+        colorscale="YlOrRd"
+    ))
+
+    fig.update_layout(
+        title=f"{source_type.title()} Card Ownership Evidence",
+        xaxis_title="Card ID",
+        yaxis_title="Likely Driver",
+        height=900
+    )
+
+    return fig
+
+
+def make_best_card_owner_table():
+    table = get_best_card_owner_table()
+
+    return dash_table.DataTable(
+        columns=[
+            {"name": "Source", "id": "source"},
+            {"name": "Card ID", "id": "card_id"},
+            {"name": "Vehicle", "id": "vehicle_id"},
+            {"name": "Driver", "id": "driver_name"},
+            {"name": "Matches", "id": "match_count"},
+            {"name": "Days", "id": "unique_days"},
+            {"name": "Locations", "id": "unique_locations"},
+            {"name": "Avg Distance", "id": "avg_distance"},
+            {"name": "Confidence", "id": "confidence_score"}
+        ],
+        data=table.to_dict("records"),
+        page_size=20,
+        sort_action="native",
+        filter_action="native",
+        style_table={"overflowX": "auto"}
+    )
 
 # -------------------------
 # Precompute matching
@@ -782,6 +1169,36 @@ def question2_layout():
         )
     ])
 
+def question3_layout():
+    return html.Div([
+        html.H2("Question 3 — Card Ownership Inference"),
+
+        html.P(
+            "This page estimates which employee owns each credit card and loyalty card "
+            "by matching card transactions to nearby vehicle GPS traces. Higher scores "
+            "mean stronger repeated evidence across time, locations, and days."
+        ),
+
+        html.H3("Best Inferred Owner for Each Card"),
+        make_best_card_owner_table(),
+
+        html.H3("Credit Card Ownership Heatmap"),
+        dcc.Graph(figure=make_card_owner_heatmap("credit")),
+
+        html.H3("Loyalty Card Ownership Heatmap"),
+        dcc.Graph(figure=make_card_owner_heatmap("loyalty")),
+
+        html.H3("Estimated Home Locations and Possible Sleepovers"),
+        html.P(
+            "Home locations are estimated from where vehicles remain overnight. "
+            "Large deviations from usual overnight locations may indicate sleepovers, "
+            "shared residences, unusual travel, or noisy GPS behavior."
+        ),
+        dcc.Graph(figure=make_home_location_map()),
+
+        html.H3("Overnight Anomalies"),
+        make_sleepover_table()
+    ])
 
 def placeholder_layout(question_number, title):
     return html.Div([
@@ -799,7 +1216,7 @@ app.layout = html.Div([
     dcc.Tabs([
         dcc.Tab(label="Question 1", children=question1_layout()),
         dcc.Tab(label="Question 2", children=question2_layout()),
-        dcc.Tab(label="Question 3", children=placeholder_layout(3, "Card Ownership Inference")),
+        dcc.Tab(label="Question 3", children=question3_layout()),
         dcc.Tab(label="Question 4", children=placeholder_layout(4, "Informal Relationships")),
         dcc.Tab(label="Question 5", children=placeholder_layout(5, "Suspicious Activity"))
     ])
