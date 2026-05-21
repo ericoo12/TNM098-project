@@ -319,8 +319,8 @@ def get_vehicle_card_matches():
         ) ** 0.5
 
         nearby_gps = nearby_gps[
-            nearby_gps["distance"] <= DISTANCE_THRESHOLD_PIXELS
-        ]
+            nearby_gps["distance"] <= 80
+            ]
 
         if nearby_gps.empty:
             continue
@@ -397,7 +397,12 @@ card_owner_scores = infer_card_owners()
 
 
 def get_best_card_owner_table():
-    best = card_owner_scores[card_owner_scores["rank_for_card"] == 1].copy()
+    best = card_owner_scores[
+        (card_owner_scores["rank_for_card"] == 1) &
+        (card_owner_scores["match_count"] >= 4) &
+        (card_owner_scores["unique_days"] >= 3) &
+        (card_owner_scores["unique_locations"] >= 2)
+        ].copy()
 
     best = best.sort_values("confidence_score", ascending=False)
 
