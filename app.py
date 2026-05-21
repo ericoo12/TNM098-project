@@ -319,8 +319,8 @@ def get_vehicle_card_matches():
         ) ** 0.5
 
         nearby_gps = nearby_gps[
-            nearby_gps["distance"] <= DISTANCE_THRESHOLD_PIXELS
-        ]
+            nearby_gps["distance"] <= 80
+            ]
 
         if nearby_gps.empty:
             continue
@@ -397,7 +397,12 @@ card_owner_scores = infer_card_owners()
 
 
 def get_best_card_owner_table():
-    best = card_owner_scores[card_owner_scores["rank_for_card"] == 1].copy()
+    best = card_owner_scores[
+        (card_owner_scores["rank_for_card"] == 1) &
+        (card_owner_scores["match_count"] >= 4) &
+        (card_owner_scores["unique_days"] >= 3) &
+        (card_owner_scores["unique_locations"] >= 2)
+        ].copy()
 
     best = best.sort_values("confidence_score", ascending=False)
 
@@ -413,38 +418,63 @@ def get_best_card_owner_table():
         "confidence_score"
     ]]
 
-def get_overnight_locations():
-    night_gps = gps[
-        (gps["timestamp"].dt.hour >= 22) |
-        (gps["timestamp"].dt.hour <= 5)
-    ].copy()
+def get_home_candidate_points():
+    df = gps.copy()
+    df["date"] = df["timestamp"].dt.date
+    df["hour"] = df["timestamp"].dt.hour
 
-    overnight = (
-        night_gps
-        .groupby(["id", "name", night_gps["timestamp"].dt.date])
-        .agg(
-            x_pix=("x_pix", "mean"),
-            y_pix=("y_pix", "mean"),
-            point_count=("timestamp", "count")
-        )
-        .reset_index()
-        .rename(columns={"timestamp": "date"})
-    )
+    candidates = []
 
-    return overnight
+    for (vehicle_id, date), day_df in df.groupby(["id", "date"]):
+        day_df = day_df.sort_values("timestamp")
+
+        morning = day_df[
+            (day_df["hour"] >= 5) &
+            (day_df["hour"] <= 10)
+        ]
+
+        evening = day_df[
+            (day_df["hour"] >= 17) &
+            (day_df["hour"] <= 23)
+        ]
+
+        if not morning.empty:
+            first = morning.iloc[0]
+            candidates.append({
+                "id": vehicle_id,
+                "name": first["name"] if pd.notna(first["name"]) else "Unknown / company truck",
+                "date": date,
+                "type": "morning_start",
+                "x_pix": first["x_pix"],
+                "y_pix": first["y_pix"]
+            })
+
+        if not evening.empty:
+            last = evening.iloc[-1]
+            candidates.append({
+                "id": vehicle_id,
+                "name": last["name"] if pd.notna(last["name"]) else "Unknown / company truck",
+                "date": date,
+                "type": "evening_end",
+                "x_pix": last["x_pix"],
+                "y_pix": last["y_pix"]
+            })
+
+    return pd.DataFrame(candidates)
 
 
-overnight_locations = get_overnight_locations()
+home_candidate_points = get_home_candidate_points()
 
 
 def get_home_locations():
     home = (
-        overnight_locations
-        .groupby(["id", "name"])
+        home_candidate_points
+        .groupby(["id", "name"], dropna=False)
         .agg(
             home_x=("x_pix", "median"),
             home_y=("y_pix", "median"),
-            nights_observed=("date", "nunique")
+            evidence_points=("date", "count"),
+            days_observed=("date", "nunique")
         )
         .reset_index()
     )
@@ -456,22 +486,24 @@ home_locations = get_home_locations()
 
 
 def get_sleepover_anomalies():
-    overnight = overnight_locations.merge(
+    candidates = home_candidate_points.merge(
         home_locations[["id", "home_x", "home_y"]],
         on="id",
         how="left"
     )
 
-    overnight["distance_from_home"] = (
-        (overnight["x_pix"] - overnight["home_x"]) ** 2 +
-        (overnight["y_pix"] - overnight["home_y"]) ** 2
+    candidates["distance_from_home"] = (
+        (candidates["x_pix"] - candidates["home_x"]) ** 2 +
+        (candidates["y_pix"] - candidates["home_y"]) ** 2
     ) ** 0.5
 
-    anomalies = overnight[overnight["distance_from_home"] > 250].copy()
+    anomalies = candidates[candidates["distance_from_home"] > 250].copy()
     anomalies["distance_from_home"] = anomalies["distance_from_home"].round(1)
 
     return anomalies.sort_values("distance_from_home", ascending=False)
 
+
+sleepover_anomalies = get_sleepover_anomalies()
 
 sleepover_anomalies = get_sleepover_anomalies()
 
@@ -490,11 +522,12 @@ def make_home_location_map():
             line=dict(width=2)
         ),
         name="Estimated home locations",
-        customdata=home_locations[["id", "nights_observed"]],
+        customdata=home_locations[["id", "days_observed", "evidence_points"]],
         hovertemplate=(
             "Driver: %{text}<br>"
             "Vehicle: %{customdata[0]}<br>"
-            "Nights observed: %{customdata[1]}"
+            "Days observed: %{customdata[1]}<br>"
+            "Evidence points: %{customdata[2]}"
             "<extra></extra>"
         )
     ))
@@ -568,14 +601,14 @@ def make_sleepover_table():
             {"name": "Driver", "id": "name"},
             {"name": "Date", "id": "date"},
             {"name": "Distance from Home", "id": "distance_from_home"},
-            {"name": "GPS Points", "id": "point_count"}
+            {"name": "Type", "id": "type"}
         ],
         data=table[[
             "id",
             "name",
             "date",
             "distance_from_home",
-            "point_count"
+            "type"
         ]].to_dict("records"),
         page_size=15,
         sort_action="native",
@@ -1165,11 +1198,6 @@ def question3_layout():
     return html.Div([
         html.H2("Question 3 — Card Ownership Inference"),
 
-        html.P(
-            "This page estimates which employee owns each credit card and loyalty card "
-            "by matching card transactions to nearby vehicle GPS traces. Higher scores "
-            "mean stronger repeated evidence across time, locations, and days."
-        ),
 
         html.H3("Best Inferred Owner for Each Card"),
         make_best_card_owner_table(),
@@ -1194,8 +1222,7 @@ def question3_layout():
 
 def placeholder_layout(question_number, title):
     return html.Div([
-        html.H2(f"Question {question_number} — {title}"),
-        html.P("This page can be developed later.")
+        html.H2(f"Question {question_number} — {title}")
     ])
 
 
